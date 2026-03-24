@@ -1,0 +1,5 @@
+/.pytest_cache
+/.venv
+/data
+/feedback.md
+/quineformer.egg-info
