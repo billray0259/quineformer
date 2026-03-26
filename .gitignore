@@ -3,3 +3,10 @@
 /data
 /feedback.md
 /quineformer.egg-info
+.env
+/archive
+__pycache__/
+data/
+results_v*/
+*.log
+wandb/

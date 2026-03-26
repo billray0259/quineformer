@@ -2,6 +2,65 @@ import torch
 from torch import Tensor
 
 
+def vector_component_labels(config) -> list[str]:
+    """Return a component-type label for each row of the serialized matrix.
+
+    The label order exactly mirrors serialize(): global embeddings first,
+    then per-layer attention/MLP/LayerNorm blocks.
+
+    Args:
+        config: BertConfig, BertModel, or BertForMaskedLM (config is extracted).
+
+    Returns:
+        List of strings, length N (same as serialize(model).shape[0]).
+        Labels are: 'word_emb', 'pos_emb', 'type_emb', 'emb_ln_gamma',
+        'emb_ln_beta', 'Q', 'K', 'V', 'O', 'b_O', 'attn_ln_gamma',
+        'attn_ln_beta', 'mlp_up', 'mlp_down', 'b_2', 'mlp_ln_gamma',
+        'mlp_ln_beta'.
+    """
+    from transformers import BertModel, BertForMaskedLM, BertConfig
+
+    if isinstance(config, BertForMaskedLM):
+        config = config.bert.config
+    elif isinstance(config, BertModel):
+        config = config.config
+    elif not isinstance(config, BertConfig):
+        raise TypeError(f"Expected BertConfig, BertModel, or BertForMaskedLM, got {type(config)}")
+
+    d = config.hidden_size
+    d_ff = config.intermediate_size
+    vocab = config.vocab_size
+    max_pos = config.max_position_embeddings
+    n_type = config.type_vocab_size
+    n_layers = config.num_hidden_layers
+
+    labels: list[str] = []
+
+    # ── Global embeddings ──────────────────────────────────────────
+    labels.extend(['word_emb'] * vocab)
+    labels.extend(['pos_emb'] * max_pos)
+    labels.extend(['type_emb'] * n_type)
+    labels.append('emb_ln_gamma')
+    labels.append('emb_ln_beta')
+
+    # ── Encoder layers ─────────────────────────────────────────────
+    for _ in range(n_layers):
+        labels.extend(['Q'] * d)
+        labels.extend(['K'] * d)
+        labels.extend(['V'] * d)
+        labels.extend(['O'] * d)
+        labels.append('b_O')
+        labels.append('attn_ln_gamma')
+        labels.append('attn_ln_beta')
+        labels.extend(['mlp_up'] * d_ff)
+        labels.extend(['mlp_down'] * d_ff)
+        labels.append('b_2')
+        labels.append('mlp_ln_gamma')
+        labels.append('mlp_ln_beta')
+
+    return labels
+
+
 def serialize(model) -> Tensor:
     """Serialize a BERT model into an (N, d_model+1) matrix.
 
@@ -188,4 +247,101 @@ def deserialize(data: Tensor, config) -> dict[str, Tensor]:
     assert idx == data.shape[0], \
         f"Consumed {idx} rows but data has {data.shape[0]}"
 
+    return params
+
+
+def encoder_layer_row_bounds(config, layer_idx: int) -> tuple[int, int]:
+    """Return the serialized row bounds for one encoder layer."""
+    from transformers import BertModel, BertForMaskedLM, BertConfig
+
+    if isinstance(config, BertForMaskedLM):
+        config = config.bert.config
+    elif isinstance(config, BertModel):
+        config = config.config
+    elif not isinstance(config, BertConfig):
+        raise TypeError(f"Expected BertConfig, BertModel, or BertForMaskedLM, got {type(config)}")
+
+    if not 0 <= layer_idx < config.num_hidden_layers:
+        raise IndexError(
+            f"layer_idx={layer_idx} out of range for {config.num_hidden_layers} layers"
+        )
+
+    d = config.hidden_size
+    d_ff = config.intermediate_size
+    prefix = config.vocab_size + config.max_position_embeddings + config.type_vocab_size + 2
+    rows_per_layer = 4 * d + 2 * d_ff + 6
+    start = prefix + layer_idx * rows_per_layer
+    return start, start + rows_per_layer
+
+
+def deserialize_encoder_layer(data: Tensor, config) -> dict[str, Tensor]:
+    """Reconstruct one BertLayer state dict from its serialized row slice.
+
+    Args:
+        data: (4*d + 2*d_ff + 6, d+1) tensor containing exactly one encoder
+            layer's serialized rows.
+        config: BertConfig, BertModel, or BertForMaskedLM.
+
+    Returns:
+        dict keyed like a BertLayer state_dict, e.g. `attention.self.query.weight`.
+    """
+    from transformers import BertModel, BertForMaskedLM, BertConfig
+
+    if isinstance(config, BertForMaskedLM):
+        config = config.bert.config
+    elif isinstance(config, BertModel):
+        config = config.config
+    elif not isinstance(config, BertConfig):
+        raise TypeError(f"Expected BertConfig, BertModel, or BertForMaskedLM, got {type(config)}")
+
+    d = config.hidden_size
+    d_ff = config.intermediate_size
+    expected_rows = 4 * d + 2 * d_ff + 6
+    if data.shape != (expected_rows, d + 1):
+        raise ValueError(
+            f"Expected layer data shape {(expected_rows, d + 1)}, got {tuple(data.shape)}"
+        )
+
+    params: dict[str, Tensor] = {}
+    idx = 0
+
+    def take(n: int) -> Tensor:
+        nonlocal idx
+        chunk = data[idx : idx + n]
+        idx += n
+        return chunk
+
+    def split_bias(rows: Tensor) -> tuple[Tensor, Tensor]:
+        return rows[:, :d], rows[:, d]
+
+    def to_vec(rows: Tensor) -> Tensor:
+        return rows[0, :d]
+
+    w, b = split_bias(take(d))
+    params["attention.self.query.weight"] = w
+    params["attention.self.query.bias"] = b
+
+    w, b = split_bias(take(d))
+    params["attention.self.key.weight"] = w
+    params["attention.self.key.bias"] = b
+
+    w, b = split_bias(take(d))
+    params["attention.self.value.weight"] = w
+    params["attention.self.value.bias"] = b
+
+    params["attention.output.dense.weight"] = take(d)[:, :d].t()
+    params["attention.output.dense.bias"] = to_vec(take(1))
+    params["attention.output.LayerNorm.weight"] = to_vec(take(1))
+    params["attention.output.LayerNorm.bias"] = to_vec(take(1))
+
+    w, b = split_bias(take(d_ff))
+    params["intermediate.dense.weight"] = w
+    params["intermediate.dense.bias"] = b
+
+    params["output.dense.weight"] = take(d_ff)[:, :d].t()
+    params["output.dense.bias"] = to_vec(take(1))
+    params["output.LayerNorm.weight"] = to_vec(take(1))
+    params["output.LayerNorm.bias"] = to_vec(take(1))
+
+    assert idx == data.shape[0], f"Consumed {idx} rows but layer data has {data.shape[0]}"
     return params

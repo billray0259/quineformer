@@ -2,7 +2,13 @@ import pytest
 import torch
 from transformers import BertForMaskedLM, BertConfig
 
-from quineformer.serialization import serialize, deserialize
+from quineformer.serialization import (
+    serialize,
+    deserialize,
+    vector_component_labels,
+    encoder_layer_row_bounds,
+    deserialize_encoder_layer,
+)
 
 
 # ── Shared fixtures ────────────────────────────────────────────────
@@ -219,3 +225,97 @@ class TestConfigExtraction:
     def test_serialize_rejects_bad_type(self):
         with pytest.raises(TypeError):
             serialize("not a model")
+
+
+# ── Component label tests ──────────────────────────────────────────
+
+class TestVectorComponentLabels:
+    def test_length_matches_serialized(self, tiny_bert, serialized):
+        labels = vector_component_labels(tiny_bert)
+        assert len(labels) == serialized.shape[0]
+
+    def test_accepts_config(self):
+        config = BertConfig(**BERT_BASE_CONFIG)
+        labels = vector_component_labels(config)
+        d = BERT_BASE_CONFIG["hidden_size"]
+        d_ff = BERT_BASE_CONFIG["intermediate_size"]
+        vocab = BERT_BASE_CONFIG["vocab_size"]
+        max_pos = BERT_BASE_CONFIG["max_position_embeddings"]
+        n_type = BERT_BASE_CONFIG["type_vocab_size"]
+        n_layers = BERT_BASE_CONFIG["num_hidden_layers"]
+        expected = vocab + max_pos + n_type + 2 + n_layers * (d * 4 + d_ff * 2 + 6)
+        assert len(labels) == expected
+
+    def test_known_label_set(self):
+        config = BertConfig(**BERT_BASE_CONFIG)
+        labels = vector_component_labels(config)
+        expected_types = {
+            'word_emb', 'pos_emb', 'type_emb', 'emb_ln_gamma', 'emb_ln_beta',
+            'Q', 'K', 'V', 'O', 'b_O', 'attn_ln_gamma', 'attn_ln_beta',
+            'mlp_up', 'mlp_down', 'b_2', 'mlp_ln_gamma', 'mlp_ln_beta',
+        }
+        assert set(labels) == expected_types
+
+    def test_global_embeddings_first(self):
+        config = BertConfig(**BERT_BASE_CONFIG)
+        labels = vector_component_labels(config)
+        vocab = BERT_BASE_CONFIG["vocab_size"]
+        assert all(l == 'word_emb' for l in labels[:vocab])
+
+    def test_per_layer_order(self):
+        config = BertConfig(**BERT_BASE_CONFIG)
+        labels = vector_component_labels(config)
+        d = BERT_BASE_CONFIG["hidden_size"]
+        d_ff = BERT_BASE_CONFIG["intermediate_size"]
+        vocab = BERT_BASE_CONFIG["vocab_size"]
+        max_pos = BERT_BASE_CONFIG["max_position_embeddings"]
+        n_type = BERT_BASE_CONFIG["type_vocab_size"]
+        # Start of first layer
+        start = vocab + max_pos + n_type + 2
+        expected_layer = (
+            ['Q'] * d + ['K'] * d + ['V'] * d + ['O'] * d
+            + ['b_O', 'attn_ln_gamma', 'attn_ln_beta']
+            + ['mlp_up'] * d_ff + ['mlp_down'] * d_ff
+            + ['b_2', 'mlp_ln_gamma', 'mlp_ln_beta']
+        )
+        assert labels[start:start + len(expected_layer)] == expected_layer
+
+    def test_rejects_bad_type(self):
+        with pytest.raises(TypeError):
+            vector_component_labels("not a config")
+
+
+class TestEncoderLayerHelpers:
+    def test_encoder_layer_row_bounds_match_expected_width(self):
+        config = BertConfig(**BERT_BASE_CONFIG)
+        start, end = encoder_layer_row_bounds(config, 0)
+        d = BERT_BASE_CONFIG["hidden_size"]
+        d_ff = BERT_BASE_CONFIG["intermediate_size"]
+        assert end - start == 4 * d + 2 * d_ff + 6
+
+    def test_encoder_layer_row_bounds_reject_bad_index(self):
+        config = BertConfig(**BERT_BASE_CONFIG)
+        with pytest.raises(IndexError):
+            encoder_layer_row_bounds(config, config.num_hidden_layers)
+
+    def test_deserialize_encoder_layer_matches_full_deserialize(self, tiny_bert, serialized):
+        full = deserialize(serialized, tiny_bert)
+
+        for layer_idx in range(BERT_BASE_CONFIG["num_hidden_layers"]):
+            start, end = encoder_layer_row_bounds(tiny_bert, layer_idx)
+            layer_params = deserialize_encoder_layer(serialized[start:end], tiny_bert)
+            prefix = f"encoder.layer.{layer_idx}."
+            expected = {
+                key[len(prefix):]: value
+                for key, value in full.items()
+                if key.startswith(prefix)
+            }
+            assert set(layer_params) == set(expected)
+            for key, value in layer_params.items():
+                assert torch.equal(value, expected[key]), f"Mismatch for layer {layer_idx} key {key}"
+
+    def test_deserialize_encoder_layer_rejects_bad_shape(self):
+        config = BertConfig(**BERT_BASE_CONFIG)
+        bad = torch.zeros(5, config.hidden_size + 1)
+        with pytest.raises(ValueError):
+            deserialize_encoder_layer(bad, config)
