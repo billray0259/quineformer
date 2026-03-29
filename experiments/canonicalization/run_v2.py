@@ -8,10 +8,11 @@ High-level training step:
   1. Compute model-level permutations P_i and P_j from endpoint embeddings.
   2. Pick one encoder layer l.
   3. Interpolate that layer's absorbed parameters in canonical space.
-  4. Map the interpolated layer back into model i's basis and execute only that
-     BertLayer on an interpolated canonical residual stream.
-  5. Compare the predicted output residual stream to the interpolated canonical
-     endpoint output residual stream.
+  4. Decode that canonical midpoint back into both endpoint bases.
+  5. Execute only that BertLayer in each decoded basis and map the predicted
+      outputs back to canonical space.
+  6. Compare the predicted canonical output residual streams to the
+      interpolated canonical endpoint output residual stream.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ load_dotenv("../../.env")
 
 import torch
 import torch.nn.functional as F
+from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
 from transformers import BertConfig, BertForMaskedLM, BertTokenizer
 
@@ -48,7 +50,9 @@ from quineformer.bias_absorption import (
 from quineformer.canonicalization import CanonicalizationModule
 from quineformer.canonicalization import sinkhorn
 from quineformer.experiment_utils import (
+    decode_mlm_head_params,
     get_extended_attention_mask,
+    interpolate_mlm_head_params,
     load_frozen_bias_projection,
     load_serialized_models,
     run_functional_mlm_logits,
@@ -71,6 +75,40 @@ WANDB_PROJECT = "quineformer-canonicalization"
 
 TRAIN_SEEDS = list(range(20))
 TEST_SEEDS = list(range(20, 25))
+MAX_EXP_INPUT = math.log(torch.finfo(torch.float64).max)
+
+
+def safe_exp(value: float) -> float:
+    """Exponentiate a metric value without crashing on catastrophic losses."""
+    if math.isnan(value):
+        return float("nan")
+    if value >= MAX_EXP_INPUT:
+        return float("inf")
+    return math.exp(value)
+
+
+def linear_tau_schedule(epoch: int, total_epochs: int, tau_start: float, tau_end: float) -> float:
+    """Linearly anneal tau over epochs."""
+    if total_epochs <= 1:
+        return tau_start
+    progress = epoch / (total_epochs - 1)
+    return tau_start + progress * (tau_end - tau_start)
+
+
+def set_module_tau(canon_module: CanonicalizationModule, tau: float) -> None:
+    """Overwrite the module temperature with the scheduled value."""
+    safe_tau = max(float(tau), 1e-6)
+    with torch.no_grad():
+        canon_module.log_tau.fill_(math.log(safe_tau))
+
+
+def project_to_hard_permutation(soft_permutation: torch.Tensor) -> torch.Tensor:
+    """Project a soft transport matrix onto the nearest hard permutation."""
+    assignment_scores = soft_permutation.detach().float().cpu().numpy()
+    row_ind, col_ind = linear_sum_assignment(-assignment_scores)
+    hard = torch.zeros_like(soft_permutation)
+    hard[row_ind, col_ind] = 1.0
+    return hard
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,9 +118,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps-per-epoch", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--lambda-sharp", type=float, default=0.1)
+    parser.add_argument("--lambda-sharp", type=float, default=0.0)
     parser.add_argument("--sinkhorn-iters", type=int, default=20)
-    parser.add_argument("--tau-init", type=float, default=0.5)
+    parser.add_argument("--tau-init", type=float, default=1.0)
+    parser.add_argument("--tau-final", type=float, default=0.05)
     parser.add_argument("--alpha", type=float, default=0.5)
     parser.add_argument("--num-samples", type=int, default=4)
     parser.add_argument("--max-length", type=int, default=128)
@@ -91,7 +130,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--activation-dataset-dir", type=Path, default=DEFAULT_ACTIVATION_DATASET_DIR)
     parser.add_argument("--steps-per-shard", type=int, default=32)
-    parser.add_argument("--train-live-shards", type=int, default=4)
+    parser.add_argument("--train-live-shards", type=int, default=2)
     parser.add_argument("--validation-batches", type=int, default=1)
     parser.add_argument("--final-eval-batches", type=int, default=4)
     parser.add_argument("--smoke-test", action="store_true")
@@ -452,20 +491,39 @@ def build_interpolated_layer_params(
     absorbed_j: torch.Tensor,
     P_i: torch.Tensor,
     P_j: torch.Tensor,
+    basis_inverse: torch.Tensor,
     layer_idx: int,
     alpha: float,
     config: BertConfig,
     device: torch.device,
-) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-    """Interpolate one encoder layer in canonical space and map it to model i's basis."""
+) -> dict[str, torch.Tensor]:
+    """Decode one canonical layer midpoint back into a chosen endpoint basis."""
     start, end = encoder_layer_row_bounds(config, layer_idx)
-    P_i_inv = torch.linalg.pinv(P_i.float())
 
     canon_i = absorbed_i[start:end] @ P_i
     canon_j = absorbed_j[start:end] @ P_j
-    interp_absorbed = ((1.0 - alpha) * canon_i + alpha * canon_j).float() @ P_i_inv
+    interp_absorbed = ((1.0 - alpha) * canon_i + alpha * canon_j).float() @ basis_inverse
     layer_rows = restore_layer_rows(projection, interp_absorbed, config, layer_idx, device)
-    return deserialize_encoder_layer(layer_rows, config), P_i_inv
+    return deserialize_encoder_layer(layer_rows, config)
+
+
+def build_interpolated_model_params(
+    projection: BiasProjection,
+    absorbed_i: torch.Tensor,
+    absorbed_j: torch.Tensor,
+    P_i: torch.Tensor,
+    P_j: torch.Tensor,
+    basis_inverse: torch.Tensor,
+    alpha: float,
+    config: BertConfig,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Decode one canonical full-model midpoint back into a chosen endpoint basis."""
+    canon_i = absorbed_i @ P_i
+    canon_j = absorbed_j @ P_j
+    interp_absorbed = ((1.0 - alpha) * canon_i + alpha * canon_j).float() @ basis_inverse
+    interp_restored = restore_bias_rows_only(projection, interp_absorbed, config, device)
+    return deserialize(interp_restored, config)
 
 
 def run_interpolated_layer(
@@ -491,6 +549,7 @@ def invert_soft_permutation(
     cond_threshold: float = 1e4,
     tau_decay: float = 0.9,
     max_attempts: int = 24,
+    hard: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build a soft permutation and sharpen it until a true inverse is usable."""
     E_t = embeddings.permute(0, 2, 1)
@@ -501,6 +560,14 @@ def invert_soft_permutation(
     tau = float(canon_module.tau.detach().item())
     best_pair: tuple[torch.Tensor, torch.Tensor] | None = None
     best_cond = float("inf")
+
+    if hard:
+        soft_permutation = sinkhorn(
+            attention_logits / tau,
+            n_iters=canon_module.sinkhorn_iters,
+        ).squeeze(0)
+        hard_permutation = project_to_hard_permutation(soft_permutation)
+        return hard_permutation, hard_permutation.transpose(0, 1)
 
     for _ in range(max_attempts):
         P = sinkhorn(attention_logits / tau, n_iters=canon_module.sinkhorn_iters).squeeze(0)
@@ -547,17 +614,34 @@ def compute_layer_loss(
     absorbed_i = absorbed[seed_i].to(device)
     absorbed_j = absorbed[seed_j].to(device)
 
-    _, P_i = canon_module(absorbed_i[:vocab_size].unsqueeze(0))
-    _, P_j = canon_module(absorbed_j[:vocab_size].unsqueeze(0))
-    P_i = P_i.squeeze(0)
-    P_j = P_j.squeeze(0)
+    P_i, P_i_inv = invert_soft_permutation(
+        canon_module,
+        absorbed_i[:vocab_size].unsqueeze(0),
+    )
+    P_j, P_j_inv = invert_soft_permutation(
+        canon_module,
+        absorbed_j[:vocab_size].unsqueeze(0),
+    )
 
-    layer_params, P_i_inv = build_interpolated_layer_params(
+    layer_params_i = build_interpolated_layer_params(
         projection,
         absorbed_i,
         absorbed_j,
         P_i,
         P_j,
+        P_i_inv,
+        layer_idx,
+        alpha,
+        config,
+        device,
+    )
+    layer_params_j = build_interpolated_layer_params(
+        projection,
+        absorbed_i,
+        absorbed_j,
+        P_i,
+        P_j,
+        P_j_inv,
         layer_idx,
         alpha,
         config,
@@ -573,17 +657,25 @@ def compute_layer_loss(
 
     input_can = (1.0 - alpha) * (h_i_in @ P_i) + alpha * (h_j_in @ P_j)
     target_can = (1.0 - alpha) * (h_i_out @ P_i) + alpha * (h_j_out @ P_j)
+    input_i = input_can @ P_i_inv
+    input_j = input_can @ P_j_inv
 
-    exec_input = input_can.float() @ P_i_inv
-    pred_exec = run_interpolated_layer(
+    pred_i = run_interpolated_layer(
         shell_layer,
-        layer_params,
-        exec_input,
+        layer_params_i,
+        input_i.float(),
         extended_mask,
-    )
-    pred_can = pred_exec @ P_i
+    ) @ P_i
+    pred_j = run_interpolated_layer(
+        shell_layer,
+        layer_params_j,
+        input_j.float(),
+        extended_mask,
+    ) @ P_j
 
-    loss_pred = F.mse_loss(pred_can, target_can)
+    loss_pred_i = F.mse_loss(pred_i, target_can)
+    loss_pred_j = F.mse_loss(pred_j, target_can)
+    loss_pred = 0.5 * (loss_pred_i + loss_pred_j)
     loss_sharp = 0.5 * (
         canon_module.row_entropy(P_i.unsqueeze(0))
         + canon_module.row_entropy(P_j.unsqueeze(0))
@@ -591,6 +683,8 @@ def compute_layer_loss(
     total = loss_pred + lambda_sharp * loss_sharp
     metrics = {
         "loss_pred": loss_pred.item(),
+        "loss_pred_i": loss_pred_i.item(),
+        "loss_pred_j": loss_pred_j.item(),
         "loss_sharp": loss_sharp.item(),
         "loss_total": total.item(),
         "tau": canon_module.tau.item(),
@@ -655,7 +749,7 @@ def evaluate_perplexity(
     eval_pairs: int,
     test_seeds: list[int],
 ) -> list[dict[str, float | int]]:
-    """Run a compact held-out perplexity check after training."""
+    """Run a compact held-out perplexity check with midpoint decode in both bases."""
     results = []
     pairs = list(combinations(test_seeds, 2))[:eval_pairs]
 
@@ -667,17 +761,55 @@ def evaluate_perplexity(
                 P_i, P_i_inv = invert_soft_permutation(
                     canon_module,
                     absorbed_i[: config.vocab_size].unsqueeze(0),
+                    hard=True,
                 )
-                P_j, _ = invert_soft_permutation(
+                P_j, P_j_inv = invert_soft_permutation(
                     canon_module,
                     absorbed_j[: config.vocab_size].unsqueeze(0),
+                    hard=True,
                 )
 
-                canon_i = absorbed_i @ P_i
-                canon_j = absorbed_j @ P_j
-                interp_absorbed = (0.5 * canon_i + 0.5 * canon_j).float() @ P_i_inv
-                interp_restored = restore_bias_rows_only(projection, interp_absorbed, config, device)
-                interp_params = deserialize(interp_restored, config)
+                interp_params_i = build_interpolated_model_params(
+                    projection,
+                    absorbed_i,
+                    absorbed_j,
+                    P_i,
+                    P_j,
+                    P_i_inv,
+                    alpha=0.5,
+                    config=config,
+                    device=device,
+                )
+                interp_params_j = build_interpolated_model_params(
+                    projection,
+                    absorbed_i,
+                    absorbed_j,
+                    P_i,
+                    P_j,
+                    P_j_inv,
+                    alpha=0.5,
+                    config=config,
+                    device=device,
+                )
+                interp_head_canonical = interpolate_mlm_head_params(
+                    head_params[seed_i],
+                    P_i,
+                    P_i_inv,
+                    head_params[seed_j],
+                    P_j,
+                    P_j_inv,
+                    alpha=0.5,
+                )
+                interp_head_i = decode_mlm_head_params(
+                    interp_head_canonical,
+                    P_i,
+                    P_i_inv,
+                )
+                interp_head_j = decode_mlm_head_params(
+                    interp_head_canonical,
+                    P_j,
+                    P_j_inv,
+                )
 
                 logits_i = run_functional_mlm_logits(
                     shell_model,
@@ -699,21 +831,31 @@ def evaluate_perplexity(
                     batch["labels"].to(device).view(-1),
                     ignore_index=-100,
                 )
-                interp_loss = run_functional_mlm_loss(
+                interp_loss_i = run_functional_mlm_loss(
                     shell_model,
-                    interp_params,
-                    head_params[seed_i],
+                    interp_params_i,
+                    interp_head_i,
                     batch,
                     device,
                 )
+                interp_loss_j = run_functional_mlm_loss(
+                    shell_model,
+                    interp_params_j,
+                    interp_head_j,
+                    batch,
+                    device,
+                )
+                interp_loss = 0.5 * (interp_loss_i + interp_loss_j)
 
             result = {
                 "source": f"eval_batch:{batch_idx}",
                 "seed_i": seed_i,
                 "seed_j": seed_j,
-                "interp_ppl": math.exp(float(interp_loss.item())),
-                "ensemble_ppl": math.exp(float(ensemble_loss.item())),
-                "ratio": math.exp(float(interp_loss.item() - ensemble_loss.item())),
+                "interp_ppl_i": safe_exp(float(interp_loss_i.item())),
+                "interp_ppl_j": safe_exp(float(interp_loss_j.item())),
+                "interp_ppl": safe_exp(float(interp_loss.item())),
+                "ensemble_ppl": safe_exp(float(ensemble_loss.item())),
+                "ratio": safe_exp(float(interp_loss.item() - ensemble_loss.item())),
             }
             results.append(result)
 
@@ -745,6 +887,7 @@ def evaluate_roundtrip_perplexity(
                 P, P_inv = invert_soft_permutation(
                     canon_module,
                     absorbed_seed[: config.vocab_size].unsqueeze(0),
+                    hard=True,
                 )
 
                 roundtrip_absorbed = (absorbed_seed @ P).float() @ P_inv
@@ -775,9 +918,9 @@ def evaluate_roundtrip_perplexity(
                 {
                     "source": f"eval_batch:{batch_idx}",
                     "seed": seed,
-                    "roundtrip_ppl": math.exp(float(roundtrip_loss.item())),
-                    "baseline_ppl": math.exp(float(baseline_loss.item())),
-                    "ratio": math.exp(float(roundtrip_loss.item() - baseline_loss.item())),
+                    "roundtrip_ppl": safe_exp(float(roundtrip_loss.item())),
+                    "baseline_ppl": safe_exp(float(baseline_loss.item())),
+                    "ratio": safe_exp(float(roundtrip_loss.item() - baseline_loss.item())),
                 }
             )
 
@@ -901,8 +1044,9 @@ def main() -> None:
         sinkhorn_iters=args.sinkhorn_iters,
         tau_init=args.tau_init,
     ).to(device)
+    canon_module.log_tau.requires_grad_(False)
     optimizer = torch.optim.AdamW(
-        canon_module.parameters(),
+        [parameter for parameter in canon_module.parameters() if parameter.requires_grad],
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
@@ -919,6 +1063,8 @@ def main() -> None:
     epoch_bar = tqdm(range(args.epochs), desc="Canonicalizing heads", unit="epoch")
 
     for epoch in epoch_bar:
+        scheduled_tau = linear_tau_schedule(epoch, args.epochs, args.tau_init, args.tau_final)
+        set_module_tau(canon_module, scheduled_tau)
         canon_module.train()
         random.shuffle(train_pairs)
         epoch_metrics = []

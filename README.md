@@ -196,13 +196,13 @@ The projection is lossless in the sense that E has only d_model linearly indepen
 
 Feed M's d_model rows as a sequence of d_model tokens, each of dimension d_model, into a shallow transformer. This transformer operates in the concept-probe space (which IS shared across models because W_down is a shared parameter), looking at a sequence of residual stream coordinates (which are NOT yet aligned). Its attention pattern — a (d_model × d_model) matrix — directly yields the alignment logits.
 
-Apply row-wise softmax with learned temperature τ to produce P:
+Apply Sinkhorn normalization with learned temperature τ to produce P:
 
 ```
-P = softmax(attention_logits / τ)
+P = Sinkhorn(attention_logits / τ)
 ```
 
-When τ is small and the attention is sharp, each row of P concentrates on a single column — P is approximately a permutation matrix, mapping "coordinate i in this model corresponds to position j in canonical space."
+Alternating row and column normalization makes P approximately doubly stochastic. When τ is small and the attention is sharp, each row and column of P concentrates on a single entry, so P approaches a permutation matrix that maps "coordinate i in this model corresponds to position j in canonical space."
 
 **Step 3: Apply P to every weight vector.**
 

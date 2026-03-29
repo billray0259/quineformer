@@ -35,7 +35,7 @@ class TestCanonicalizationModule:
         expected = sinkhorn(logits / model.tau, n_iters=model.sinkhorn_iters)
         assert torch.allclose(permutation, expected, atol=1e-6)
 
-    def test_sinkhorn_output_is_row_stochastic(self):
+    def test_sinkhorn_output_is_approximately_doubly_stochastic(self):
         model = CanonicalizationModule(
             vocab_size=13,
             d_model=8,
@@ -46,5 +46,7 @@ class TestCanonicalizationModule:
         _, permutation = model(embeddings)
 
         row_sums = permutation.sum(dim=-1)
+        col_sums = permutation.sum(dim=-2)
         assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-4)
+        assert torch.allclose(col_sums, torch.ones_like(col_sums), atol=1e-4)
         assert torch.all(permutation >= 0)

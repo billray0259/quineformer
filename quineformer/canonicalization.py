@@ -4,13 +4,16 @@ import math
 
 
 def sinkhorn(log_alpha: torch.Tensor, n_iters: int = 20) -> torch.Tensor:
-    """Normalize logits with a row-wise softmax.
-
-    The `n_iters` argument is preserved for API compatibility with existing
-    experiment code, but is ignored.
-    """
-    del n_iters
-    return torch.softmax(log_alpha, dim=-1)
+    """Approximate a doubly stochastic matrix with Sinkhorn iterations."""
+    log_transport = log_alpha
+    for _ in range(n_iters):
+        log_transport = log_transport - torch.logsumexp(
+            log_transport, dim=-1, keepdim=True
+        )
+        log_transport = log_transport - torch.logsumexp(
+            log_transport, dim=-2, keepdim=True
+        )
+    return log_transport.exp()
 
 
 class CanonicalizationModule(nn.Module):
@@ -19,8 +22,8 @@ class CanonicalizationModule(nn.Module):
     Architecture:
         1. W_q (vocab_size x d_model): projects E^T into coordinate queries
         2. W_k (vocab_size x d_model): projects E^T into coordinate keys
-          3. QK^T attention logits over coordinates are normalized row-wise to
-              produce a soft transport matrix P
+          3. QK^T attention logits over coordinates are normalized with
+              Sinkhorn iterations to produce a soft transport matrix P
     """
 
     def __init__(
@@ -62,7 +65,7 @@ class CanonicalizationModule(nn.Module):
         K = E_t @ self.W_k  # (batch, d_model, d_model)
         attention_logits = (Q @ K.permute(0, 2, 1)) / math.sqrt(self.d_model)
 
-        # Row-wise normalization → stochastic transport matrix
+        # Sinkhorn normalization -> doubly stochastic transport matrix
         P = sinkhorn(attention_logits / self.tau, n_iters=self.sinkhorn_iters)
 
         # Apply P to reorder embedding columns into canonical form

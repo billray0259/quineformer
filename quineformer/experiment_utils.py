@@ -141,6 +141,100 @@ def build_functional_mlm_params(
     return full_params
 
 
+def canonicalize_mlm_head_params(
+    extra_params: dict[str, Tensor],
+    permutation: Tensor,
+    permutation_inverse: Tensor,
+) -> dict[str, Tensor]:
+    """Express the untied MLM head in the canonical hidden-state basis."""
+    permutation = permutation.to(
+        device=next(iter(extra_params.values())).device,
+        dtype=next(iter(extra_params.values())).dtype,
+    )
+    permutation_inverse = permutation_inverse.to(
+        device=permutation.device,
+        dtype=permutation.dtype,
+    )
+
+    canonical: dict[str, Tensor] = {}
+    for name, value in extra_params.items():
+        tensor = value.to(device=permutation.device, dtype=permutation.dtype)
+        if name == "cls.predictions.transform.dense.weight":
+            canonical[name] = permutation_inverse @ tensor @ permutation
+        elif name == "cls.predictions.transform.dense.bias":
+            canonical[name] = tensor @ permutation
+        elif name in {
+            "cls.predictions.transform.LayerNorm.weight",
+            "cls.predictions.transform.LayerNorm.bias",
+        }:
+            canonical[name] = tensor @ permutation
+        elif name == "cls.predictions.decoder.weight":
+            canonical[name] = tensor @ permutation_inverse.transpose(0, 1)
+        else:
+            canonical[name] = tensor.clone()
+    return canonical
+
+
+def decode_mlm_head_params(
+    canonical_params: dict[str, Tensor],
+    permutation: Tensor,
+    permutation_inverse: Tensor,
+) -> dict[str, Tensor]:
+    """Map canonical MLM head parameters back into one hidden-state basis."""
+    permutation = permutation.to(
+        device=next(iter(canonical_params.values())).device,
+        dtype=next(iter(canonical_params.values())).dtype,
+    )
+    permutation_inverse = permutation_inverse.to(
+        device=permutation.device,
+        dtype=permutation.dtype,
+    )
+
+    decoded: dict[str, Tensor] = {}
+    for name, value in canonical_params.items():
+        tensor = value.to(device=permutation.device, dtype=permutation.dtype)
+        if name == "cls.predictions.transform.dense.weight":
+            decoded[name] = permutation @ tensor @ permutation_inverse
+        elif name == "cls.predictions.transform.dense.bias":
+            decoded[name] = tensor @ permutation_inverse
+        elif name in {
+            "cls.predictions.transform.LayerNorm.weight",
+            "cls.predictions.transform.LayerNorm.bias",
+        }:
+            decoded[name] = tensor @ permutation_inverse
+        elif name == "cls.predictions.decoder.weight":
+            decoded[name] = tensor @ permutation.transpose(0, 1)
+        else:
+            decoded[name] = tensor.clone()
+    return decoded
+
+
+def interpolate_mlm_head_params(
+    head_i: dict[str, Tensor],
+    permutation_i: Tensor,
+    permutation_i_inverse: Tensor,
+    head_j: dict[str, Tensor],
+    permutation_j: Tensor,
+    permutation_j_inverse: Tensor,
+    alpha: float,
+) -> dict[str, Tensor]:
+    """Canonicalize two untied MLM heads and linearly interpolate them."""
+    canonical_i = canonicalize_mlm_head_params(
+        head_i,
+        permutation_i,
+        permutation_i_inverse,
+    )
+    canonical_j = canonicalize_mlm_head_params(
+        head_j,
+        permutation_j,
+        permutation_j_inverse,
+    )
+    return {
+        name: (1.0 - alpha) * canonical_i[name] + alpha * canonical_j[name]
+        for name in canonical_i
+    }
+
+
 def run_functional_mlm_logits(
     shell_model: BertForMaskedLM,
     bert_params: dict[str, Tensor],

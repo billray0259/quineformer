@@ -7,8 +7,11 @@ from transformers import BertConfig, BertForMaskedLM
 from quineformer.bias_absorption import extract_non_bert_params
 from quineformer.experiment_utils import (
     build_functional_mlm_params,
-    sample_masked_mlm_batch_from_token_ids,
+    canonicalize_mlm_head_params,
+    decode_mlm_head_params,
     get_extended_attention_mask,
+    interpolate_mlm_head_params,
+    sample_masked_mlm_batch_from_token_ids,
     load_frozen_bias_projection,
     load_serialized_models,
     run_functional_mlm_logits,
@@ -189,6 +192,76 @@ class TestAttentionMaskAndFunctionalLoss:
         )
 
         assert torch.allclose(direct, functional)
+
+    def test_canonicalize_mlm_head_preserves_logits_under_permutation(self, tiny_bert):
+        hidden_size = tiny_bert.config.hidden_size
+        permutation_indices = torch.randperm(hidden_size)
+        permutation = torch.eye(hidden_size)[permutation_indices]
+        permutation_inverse = permutation.transpose(0, 1)
+
+        hidden_states = torch.randn(2, 8, hidden_size)
+        extra_params = extract_non_bert_params(tiny_bert)
+        canonical_head = canonicalize_mlm_head_params(
+            extra_params,
+            permutation,
+            permutation_inverse,
+        )
+
+        direct_logits = tiny_bert.cls(hidden_states)
+        canonical_logits = torch.func.functional_call(
+            tiny_bert.cls,
+            {name.removeprefix("cls."): value for name, value in canonical_head.items()},
+            args=(hidden_states @ permutation,),
+            tie_weights=False,
+        )
+
+        assert torch.allclose(direct_logits, canonical_logits, atol=1e-5)
+
+    def test_interpolate_mlm_head_respects_endpoint_limits(self, tiny_bert):
+        hidden_size = tiny_bert.config.hidden_size
+        permutation_indices = torch.randperm(hidden_size)
+        permutation = torch.eye(hidden_size)[permutation_indices]
+        permutation_inverse = permutation.transpose(0, 1)
+        extra_params = extract_non_bert_params(tiny_bert)
+
+        interpolated = interpolate_mlm_head_params(
+            extra_params,
+            permutation,
+            permutation_inverse,
+            extra_params,
+            permutation,
+            permutation_inverse,
+            alpha=0.5,
+        )
+        canonical = canonicalize_mlm_head_params(
+            extra_params,
+            permutation,
+            permutation_inverse,
+        )
+
+        for name in canonical:
+            assert torch.allclose(interpolated[name], canonical[name])
+
+    def test_decode_mlm_head_inverts_canonicalization(self, tiny_bert):
+        hidden_size = tiny_bert.config.hidden_size
+        permutation_indices = torch.randperm(hidden_size)
+        permutation = torch.eye(hidden_size)[permutation_indices]
+        permutation_inverse = permutation.transpose(0, 1)
+        extra_params = extract_non_bert_params(tiny_bert)
+
+        canonical = canonicalize_mlm_head_params(
+            extra_params,
+            permutation,
+            permutation_inverse,
+        )
+        decoded = decode_mlm_head_params(
+            canonical,
+            permutation,
+            permutation_inverse,
+        )
+
+        for name, value in extra_params.items():
+            assert torch.allclose(decoded[name], value)
 
 
 def _write_projection_checkpoint(tmp_path: Path, d_model: int) -> Path:
